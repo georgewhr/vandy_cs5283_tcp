@@ -36,12 +36,21 @@ class Client:
 #      sleep(1) # wait for startup of main thread
       self.last_received_ack = -1 # initialize last received ack
       self.receive_acks()
+      ack_header = utils.Header(self.last_received_ack, self.last_received_ack+1, syn = 0, ack = 1 )
+      send_udp(ack_header.bits())
 
     else:
       pass
 
   def terminate(self):
-    pass
+    seq_num = utils.rand_int()
+    fin_header = utils.Header(seq_num, 0,syn = 0, ack = 0, fin =1 )
+    send_udp(fin_header.bits())
+    self.update_state(States.FIN_WAIT1)
+    self.receive_acks()
+    self.update_state(States.FIN_WAIT2)
+    ack_header = utils.Header(self.last_received_ack,self.last_received_ack+1, syn = 0, ack = 1 )
+    send_udp(ack_header.bits())
 
   def update_state(self, new_state):
     if utils.DEBUG:
@@ -49,9 +58,9 @@ class Client:
     self.client_state = new_state
 
   def send_reliable_message(self, message):
-    # send messages
-    # we loop/wait until we receive all ack.
-    pass
+    syn_header = utils.Header(self.last_received_ack, self.last_received_ack+1, syn = 0, ack = 1)
+    send_udp(syn_header.bits()+message.encode())
+    
 
   # these two methods/function can be used receive messages from
   # server. the reason we need such mechanism is `recv` blocking
