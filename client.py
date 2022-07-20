@@ -6,12 +6,15 @@ import random
 import socket
 import time
 import utils
-import sys
-from time import sleep
 
 UDP_IP = "127.0.0.1"
-UDP_PORT = 5005
+#UDP_PORT = 5005 # for testing without channel
+UDP_PORT = 5007 # for testing with channel
 MSS = 12 # maximum segment size
+
+sock = socket.socket(socket.AF_INET,    # Internet
+                     socket.SOCK_DGRAM) # UDP
+sock.settimeout(3.0)
 
 def send_udp(message):
   sock.sendto(message, (UDP_IP, UDP_PORT))
@@ -19,38 +22,57 @@ def send_udp(message):
 class Client:
   def __init__(self):
     self.client_state = States.CLOSED
+    self.last_received_ack = 0
+    self.last_received_seq_num = 0
     self.handshake()
 
   def handshake(self):
-    if self.client_state == States.CLOSED:
-      seq_num = utils.rand_int()
-      syn_header = utils.Header(seq_num, 0, syn = 1, ack = 0)
-      # for this case we send only header;
-      # if you need to send data you will need to append it
-      
-      print('send handshake')
-      
-      send_udp(syn_header.bits())
-      self.update_state(States.SYN_SENT)
-      
-#      sleep(1) # wait for startup of main thread
-      self.last_received_ack = -1 # initialize last received ack
-      self.receive_acks()
-      ack_header = utils.Header(self.last_received_ack, self.last_received_ack+1, syn = 0, ack = 1 )
-      send_udp(ack_header.bits())
-
-    else:
-      pass
+    while self.client_state != States.ESTABLISHED:
+      if self.client_state == States.CLOSED:
+        seq_num = utils.rand_int()
+        self.next_seq_num = seq_num + 1
+        syn_header = utils.Header(seq_num, 0, syn = 1, ack = 0, fin = 0)
+        send_udp(syn_header.bits())
+        self.update_state(States.SYN_SENT)
+      elif self.client_state == States.SYN_SENT:
+        recv_data, addr = sock.recvfrom(1024)
+        syn_ack_header = utils.bits_to_header(recv_data)
+        self.last_received_seq_num = syn_ack_header.seq_num
+        if syn_ack_header.syn == 1 and syn_ack_header.ack == 1:
+          ack_header = utils.Header( self.next_seq_num
+                                   , self.last_received_seq_num + 1
+                                   , syn = 0, ack = 1, fin = 0)
+          self.next_seq_num += 1
+          send_udp(ack_header.bits())
+          self.update_state(States.ESTABLISHED)
+      else:
+        pass
 
   def terminate(self):
-    seq_num = utils.rand_int()
-    fin_header = utils.Header(seq_num, 0,syn = 0, ack = 0, fin =1 )
-    send_udp(fin_header.bits())
-    self.update_state(States.FIN_WAIT1)
-    self.receive_acks()
-    self.update_state(States.FIN_WAIT2)
-    ack_header = utils.Header(self.last_received_ack,self.last_received_ack+1, syn = 0, ack = 1 )
-    send_udp(ack_header.bits())
+    while self.client_state != States.CLOSED:
+      if self.client_state == States.ESTABLISHED:
+        terminate_header = utils.Header(self.next_seq_num, self.last_received_seq_num + 1, syn = 0, ack = 1, fin = 1)
+        self.next_seq_num += 1
+        send_udp(terminate_header.bits())
+        self.update_state(States.FIN_WAIT_1)
+      elif self.client_state == States.FIN_WAIT_1:
+        recv_data, addr = sock.recvfrom(1024)
+        fin_ack_header = utils.bits_to_header(recv_data)
+        self.last_received_seq_num = fin_ack_header.seq_num
+        if fin_ack_header.ack == 1:
+          self.update_state(States.FIN_WAIT_2)
+      elif self.client_state == States.FIN_WAIT_2:
+        recv_data, addr = sock.recvfrom(1024)
+        fin_fin_header = utils.bits_to_header(recv_data)
+        self.last_received_seq_num = fin_fin_header.seq_num
+        if fin_fin_header.fin == 1:
+          terminate_ack_header = utils.Header(self.next_seq_num, self.last_received_seq_num + 1, syn = 0, ack = 1, fin = 0)
+          self.next_seq_num += 1
+          send_udp(terminate_ack_header.bits())
+          # self.update_state(States.TIME_WAIT) # not implemented
+          self.update_state(States.CLOSED)
+      else:
+        pass
 
   def update_state(self, new_state):
     if utils.DEBUG:
@@ -58,63 +80,66 @@ class Client:
     self.client_state = new_state
 
   def send_reliable_message(self, message):
-    syn_header = utils.Header(self.last_received_ack, self.last_received_ack+1, syn = 0, ack = 1)
-    send_udp(syn_header.bits()+message.encode())
+    # header could reuse seq so far, or just start back at 0 for sending message as this does
+    # but need to keep track of the sequence number when doing 
+    chunks = [message[i:i+MSS] for i in range(0, len(message), MSS)]
+    print(chunks)
+    seqNum = 0
+    ackNum = 0
+    for msg in chunks:
+      msg_header = utils.Header(seqNum, ackNum, syn = 0, ack = 0, fin = 0)
+      send_udp(msg_header.bits() + msg.encode())
+      print("sending: %s"%msg)
+      try:
+        recv_data, addr = sock.recvfrom(1024)
+        ack_header = utils.bits_to_header(recv_data)
+        if ack_header.ack == 1 and ack_header.seq_num == self.last_received_seq_num+1:
+          print("msg received from server: %s"%msg)
+          self.last_received_seq_num = self.last_received_seq_num + 1
+          seqNum = self.last_received_seq_num
+          ackNum = self.last_received_ack
+        else:
+          print("lost packet")
+      except socket.timeout:
+        print("scoket timed out, might lost data, resending ...")
+        send_udp(msg_header.bits() + msg.encode())
+
+
+
+    # msg_header = utils.Header(0, 0, syn = 0, ack = 0, fin = 0)
+    # send_udp(msg_header.bits() + message.encode())
+    # recv_data, addr = sock.recvfrom(1024)
+    # ack_header = utils.bits_to_header(recv_data)
+    # print(ack_header.seq_num)
+    # print(ack_header.ack_num)
+    # print(self.last_received_seq_num)
+    # if ack_header.ack == 1 and ack_header.seq_num == self.last_received_seq_num+1:
+    #   print("msg received")
+
     
+    
+    # handle mss to send in pieces
+    # our pa03 solution does something like:
+    #     chunks=list(chunkstring(message, MSS)) # divide message into appropriate length segments
+    # then sends each of these, appropriately handling message size=MSS and seq numbers
+    # handle seq / ack appropriately
+    # handle stop and wait: resend if lost, detected by no ack in time
+    # recommend handling this via a recv and waiting until socket.timeout exception occurs, then resending
 
-  # these two methods/function can be used receive messages from
-  # server. the reason we need such mechanism is `recv` blocking
-  # and we may never recieve a package from a server for multiple
-  # reasons.
-  # 1. our message is not delivered so server cannot send an ack.
-  # 2. server responded with ack but it's not delivered due to
-  # a network failure.
-  # these functions provide a mechanism to receive messages for
-  # 1 second, then the client can decide what to do, like retransmit
-  # if not all packets are acked.
-  # you are free to implement any mechanism you feel comfortable
-  # especially, if you have a better idea ;)
-  def receive_acks_sub_process(self, s, lst_rec_ack_shared):
-    if utils.DEBUG:
-      print('subproc start in function')
-    while True:
-      recv_data, addr = s.recvfrom(1024)
-      header = utils.bits_to_header(recv_data)
-      if utils.DEBUG:
-        print('received subproc header: ')
-        print(header)
-      if header.ack_num > lst_rec_ack_shared.value:
-        lst_rec_ack_shared.value = header.ack_num
-        if utils.DEBUG:
-          print('subproc updated ack: ', lst_rec_ack_shared.value)
-
-  def receive_acks(self):
-    # Start receive_acks_sub_process as a process
-    lst_rec_ack_shared = Value('i', self.last_received_ack)
-    p = multiprocessing.Process(target=self.receive_acks_sub_process, args=(sock, lst_rec_ack_shared))
-    p.start()
-    # Wait for 1 seconds or until process finishes
-    p.join(1)
-    # If process is still active, we kill it
-    if p.is_alive():
-      p.terminate()
-      p.join()
-    # here you can update your client's instance variables.
-    self.last_received_ack = lst_rec_ack_shared.value
-    if utils.DEBUG:
-      print('received: ', self.last_received_ack)
-      print('shared variable: ', lst_rec_ack_shared)
-
-# windows requires using this main check when working with the subprocess, otherwise Client object will 
-# get recreated when using subprocess (causing potential issues with socket as well as received values), 
-# should have worked on other (*nix) platforms though
 if __name__ == "__main__":
-  sock = socket.socket(socket.AF_INET,    # Internet
-                     socket.SOCK_DGRAM) # UDP
-
-  # we create a client, which establishes a connection
   client = Client()
-  # we send a message
-  client.send_reliable_message("This message is to be received in pieces")
-  # we terminate the connection
+
+  # be sure to test with several messages of varying length as discussed
+  # particularly, be sure things work when (1) client->server msgs are lost
+  # and (2) server->client acks are lost
+  # the server should display the received full message at the end, in 
+  # the correct order, with all pieces and no missing/duplicated data
+  client.send_reliable_message("This message is to be received in pieces,the server should display the received full message at the end, in ")
+  
+  # increasing number test message (useful for debugging)
+  #n_seg = 50
+  #x = [str(i) + ' ' for i in range(0,MSS * n_seg)]
+  #x_str = ''.join(x)
+  #client.send_reliable_message(x_str)
+
   client.terminate()
